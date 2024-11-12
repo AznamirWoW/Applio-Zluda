@@ -121,6 +121,14 @@ def run_filelist(files, save_path):
    
 if __name__ == "__main__":
     save_path = r"X:\GenTest_v2\input"
+
+    os.makedirs(os.path.join(save_path, "chunks"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "sliced_audios"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "sliced_audios_16k"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "f0"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "f0c"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "feats"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "spec"), exist_ok=True)
  
     run_split(input_path=r"X:\GenTest_v2\training\Book_01.wav",  output_path=os.path.join(save_path, 'chunks'), sr=48000,)
     print('Split done')
