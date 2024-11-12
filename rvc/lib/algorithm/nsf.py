@@ -35,8 +35,9 @@ class SourceModuleHnNSF(torch.nn.Module):
 
         self.sine_amp = sine_amp
         self.noise_std = add_noise_std
-        self.is_half = is_half
-
+        #only set the value if explicitly passed 'True', otherwise leave it to the accelerator to handle
+		if is_half: 
+        	self.is_half = is_half
         self.l_sin_gen = SineGen(
             sample_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshod
         )

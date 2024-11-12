@@ -58,6 +58,7 @@ class Synthesizer(torch.nn.Module):
         sr,
         use_f0,
         text_enc_hidden_dim=768,
+        randomized=True,
         **kwargs
     ):
         super(Synthesizer, self).__init__()
@@ -79,6 +80,7 @@ class Synthesizer(torch.nn.Module):
         self.gin_channels = gin_channels
         self.spk_embed_dim = spk_embed_dim
         self.use_f0 = use_f0
+        self.randomized = randomized
 
         self.enc_p = TextEncoder(
             inter_channels,
@@ -187,13 +189,20 @@ class Synthesizer(torch.nn.Module):
         if y is not None:
             z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
             z_p = self.flow(z, y_mask, g=g)
-            z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
-            if self.use_f0:
-                pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
-                o = self.dec(z_slice, pitchf, g=g)
+            if self.randomized:
+                z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
+                if self.use_f0:
+                    pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
+                    o = self.dec(z_slice, pitchf, g=g)
+                else:
+                    o = self.dec(z_slice, g=g)
+                return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
             else:
-                o = self.dec(z_slice, g=g)
-            return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                if self.use_f0:
+                    o = self.dec(z, pitchf, g=g)
+                else:
+                    o = self.dec(z, g=g)
+                return o, None, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
         else:
             return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
 

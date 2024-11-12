@@ -144,3 +144,58 @@ def mel_spectrogram_torch(
     melspec = spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax)
 
     return melspec
+
+class MultiScaleMelSpectrogramLoss(torch.nn.Module):
+    def __init__(
+        self,
+        sample_rate: int = 24000,
+        n_mels= [20, 40, 80, 160, 320],
+        window_lengths = [128, 256, 512, 1024, 2048],
+        mel_fmin = [0, 0, 0, 0, 0,],
+        mel_fmax = [None, None, None, None, None,],
+        loss_fn = torch.nn.L1Loss(),
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.loss_fn = loss_fn
+        self.log_base = torch.log(torch.tensor(10.0))
+        self.stft_params = {}
+        self.mel_banks = {}
+        for n_mels, window_length, fmin, fmax in zip(n_mels, window_lengths, mel_fmin, mel_fmax):
+            self.stft_params[n_mels] = {
+                "n_mels": n_mels, 
+                "window_length": window_length, 
+                "hop_length": window_length // 4, 
+            }
+            self.mel_banks[n_mels] = torch.from_numpy(
+                librosa_mel_fn(
+                    sr=self.sample_rate,
+                    n_mels=n_mels,
+                    n_fft=window_length,
+                    fmin=fmin,
+                    fmax=fmax,
+                )
+            )
+    def mel_spectrogram(self, wav, n_mels, window_length, hop_length,):
+        wav = wav.squeeze(1) # -> torch(B, T)
+        window = torch.hann_window(window_length).to(wav.device).to(wav.dtype)
+        stft = torch.stft(
+            wav.float(),
+            n_fft=window_length,
+            hop_length=hop_length,
+            window=window,
+            return_complex=True,
+        ) # -> torch (B, window_length // 2 + 1, (T - window_length)/hop_length + 1)
+        magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6) 
+        mel_basis = self.mel_banks[n_mels].to(wav.device) # torch(n_mels, window_length // 2 + 1)
+        mel_spectrogram = torch.matmul(mel_basis, magnitude) # torch(B, n_mels, stft.frames)
+        return mel_spectrogram
+    def forward(self, real, fake): # real: torch(B, 1, T) , fake: torch(B, 1, T)
+        loss = 0.0
+        for p in self.stft_params.values():
+            real_mels = self.mel_spectrogram(real, **p)
+            fake_mels = self.mel_spectrogram(fake, **p)
+            real_logmels = torch.log(real_mels.clamp(min=1e-5).pow(1)) / self.log_base
+            fake_logmels = torch.log(fake_mels.clamp(min=1e-5).pow(1)) / self.log_base
+            loss += self.loss_fn(real_logmels, fake_logmels)
+        return loss

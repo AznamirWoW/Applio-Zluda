@@ -4,7 +4,7 @@ if torch.cuda.is_available() and torch.cuda.get_device_name().endswith("[ZLUDA]"
     _torch_stft = torch.stft
 
     def z_stft(
-        audio: torch.Tensor,
+        input: torch.Tensor,
         n_fft: int,
         hop_length: int = None,
         win_length: int = None,
@@ -15,9 +15,9 @@ if torch.cuda.is_available() and torch.cuda.get_device_name().endswith("[ZLUDA]"
         onesided: bool = None,
         return_complex: bool = None,
     ):
-        sd = audio.device
+        sd = input.device
         return _torch_stft(
-            audio.to("cpu"),
+            input.to("cpu"),
             n_fft=n_fft,
             hop_length=hop_length,
             win_length=win_length,
