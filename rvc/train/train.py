@@ -43,7 +43,7 @@ from losses import (
     generator_loss,
     kl_loss,
 )
-from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from mel_processing import mel_spectrogram_torch, spec_to_mel_torch, MultiScaleMelSpectrogramLoss
 
 from rvc.train.process.extract_model import extract_model
 
@@ -66,6 +66,13 @@ cache_data_in_gpu = strtobool(sys.argv[13])
 overtraining_detector = strtobool(sys.argv[14])
 overtraining_threshold = int(sys.argv[15])
 cleanup = strtobool(sys.argv[16])
+
+if len(sys.argv) > 16:
+    vocoder = sys.argv[17]
+    discriminator = sys.argv[18]
+else:
+    vocoder = "nsf"
+    discriminator = "default"
 
 current_dir = os.getcwd()
 experiment_dir = os.path.join(current_dir, "logs", model_name)
@@ -333,7 +340,7 @@ def run(
     train_sampler = DistributedBucketSampler(
         train_dataset,
         batch_size * n_gpus,
-        [100, 200, 300, 400, 500, 600, 700, 800, 900],
+        [50, 100, 200, 300, 400, 500, 600, 700, 800, 900],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
@@ -351,10 +358,17 @@ def run(
     )
 
     # Initialize models and optimizers
-    from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminator
     from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminatorV2
     from rvc.lib.algorithm.synthesizers import Synthesizer
+    # sudo-v3
+    from rvc.lib.algorithm.sub.discriminator import CombinedDiscriminator
+    from rvc.lib.algorithm.sub.mpd import MultiPeriodDiscriminator
+    from rvc.lib.algorithm.sub.mrd import MultiResolutionDiscriminator
+    from rvc.lib.algorithm.sub.msd import MultiScaleDiscriminator
+    from rvc.lib.algorithm.sub.mbd import MultiBandDiscriminator
+    from rvc.lib.algorithm.sub.mssbcqtd import MultiScaleSubbandCQTDiscriminator
 
+    print(f"Using '{vocoder}' vocoder and '{discriminator}' discriminator for training.")
     net_g = Synthesizer(
         config.data.filter_length // 2 + 1,
         config.train.segment_size // config.data.hop_length,
@@ -362,12 +376,26 @@ def run(
         use_f0=pitch_guidance == True,  # converting 1/0 to True/False
         is_half=config.train.fp16_run and device.type == "cuda",
         sr=sample_rate,
+        vocoder=vocoder
     ).to(device)
 
-    if version == "v1":
-        net_d = MultiPeriodDiscriminator(config.model.use_spectral_norm).to(device)
-    else:
+    if discriminator == "default":
         net_d = MultiPeriodDiscriminatorV2(config.model.use_spectral_norm).to(device)
+    elif discriminator == "hifigan":
+        net_d = CombinedDiscriminator([
+            MultiPeriodDiscriminator(),
+            MultiScaleDiscriminator(),
+        ]).to(device)
+    elif discriminator == "bigvganv1":
+        net_d = CombinedDiscriminator([
+            MultiPeriodDiscriminator(),
+            MultiResolutionDiscriminator(),
+        ]).to(device)
+    elif discriminator == "bigvganv2":
+        net_d = CombinedDiscriminator([
+            MultiPeriodDiscriminator(),
+            MultiScaleSubbandCQTDiscriminator(sample_rate=sample_rate),
+        ]).to(device)
 
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
@@ -375,12 +403,15 @@ def run(
         betas=config.train.betas,
         eps=config.train.eps,
     )
+    
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         config.train.learning_rate,
         betas=config.train.betas,
         eps=config.train.eps,
     )
+    
+    fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=sample_rate)
 
     # Wrap models with DDP for multi-gpu processing
     if n_gpus > 1 and device.type == "cuda":
@@ -402,7 +433,7 @@ def run(
     except:
         epoch_str = 1
         global_step = 0
-        if pretrainG != "":
+        if pretrainG != "" and pretrainG != "None":
             if rank == 0:
                 verify_checkpoint_shapes(pretrainG, net_g)
                 print(f"Loaded pretrained (G) '{pretrainG}'")
@@ -415,7 +446,7 @@ def run(
                     torch.load(pretrainG, map_location="cpu")["model"]
                 )
 
-        if pretrainD != "":
+        if pretrainD != "" and pretrainD != "None":
             if rank == 0:
                 print(f"Loaded pretrained (D) '{pretrainD}'")
             if hasattr(net_d, "module"):
@@ -493,6 +524,7 @@ def run(
             custom_total_epoch,
             device,
             reference,
+            fn_mel_loss
         )
 
         scheduler_g.step()
@@ -513,6 +545,7 @@ def train_and_evaluate(
     custom_total_epoch,
     device,
     reference,
+    fn_mel_loss
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -593,36 +626,6 @@ def train_and_evaluate(
                 y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (
                     model_output
                 )
-                # used for tensorboard chart - all/mel
-                mel = spec_to_mel_torch(
-                    spec,
-                    config.data.filter_length,
-                    config.data.n_mel_channels,
-                    config.data.sample_rate,
-                    config.data.mel_fmin,
-                    config.data.mel_fmax,
-                )
-                # used for tensorboard chart - slice/mel_org
-                y_mel = commons.slice_segments(
-                    mel,
-                    ids_slice,
-                    config.train.segment_size // config.data.hop_length,
-                    dim=3,
-                )
-                # used for tensorboard chart - slice/mel_gen
-                with autocast(enabled=False):
-                    y_hat_mel = mel_spectrogram_torch(
-                        y_hat.float().squeeze(1),
-                        config.data.filter_length,
-                        config.data.n_mel_channels,
-                        config.data.sample_rate,
-                        config.data.hop_length,
-                        config.data.win_length,
-                        config.data.mel_fmin,
-                        config.data.mel_fmax,
-                    )
-                if use_amp:
-                    y_hat_mel = y_hat_mel.half()
                 # slice of the original waveform to match a generate slice
                 wave = commons.slice_segments(
                     wave,
@@ -644,12 +647,10 @@ def train_and_evaluate(
 
             # Generator backward and update
             with autocast(enabled=use_amp):
-                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+                _, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
                 with autocast(enabled=False):
-                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * config.train.c_mel
-                    loss_kl = (
-                        kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
-                    )
+                    loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
+                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
@@ -658,11 +659,8 @@ def train_and_evaluate(
                         lowest_value["value"] = loss_gen_all
                         lowest_value["step"] = global_step
                         lowest_value["epoch"] = epoch
-                        # print(f'Lowest generator loss updated: {lowest_value["value"]} at epoch {epoch}, step {global_step}')
                         if epoch > lowest_value["epoch"]:
-                            print(
-                                "Alert: The lower generating loss has been exceeded by a lower loss in a subsequent epoch."
-                            )
+                            print("Alert: The lower generating loss has been exceeded by a lower loss in a subsequent epoch.")
 
             optim_g.zero_grad()
             scaler.scale(loss_gen_all).backward()
@@ -676,6 +674,37 @@ def train_and_evaluate(
 
     # Logging and checkpointing
     if rank == 0:
+        # used for tensorboard chart - all/mel
+        mel = spec_to_mel_torch(
+            spec,
+            config.data.filter_length,
+            config.data.n_mel_channels,
+            config.data.sample_rate,
+            config.data.mel_fmin,
+            config.data.mel_fmax,
+            )
+        # used for tensorboard chart - slice/mel_org
+        y_mel = commons.slice_segments(
+            mel,
+            ids_slice,
+            config.train.segment_size // config.data.hop_length,
+            dim=3,
+        )
+        # used for tensorboard chart - slice/mel_gen
+        with autocast(enabled=False):
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.float().squeeze(1),
+                config.data.filter_length,
+                config.data.n_mel_channels,
+                config.data.sample_rate,
+                config.data.hop_length,
+                config.data.win_length,
+                config.data.mel_fmin,
+                config.data.mel_fmax,
+                )
+            if use_amp:
+                y_hat_mel = y_hat_mel.half()    
+    
         lr = optim_g.param_groups[0]["lr"]
         if loss_mel > 75:
             loss_mel = 75
@@ -684,7 +713,7 @@ def train_and_evaluate(
         scalar_dict = {
             "loss/g/total": loss_gen_all,
             "loss/d/total": loss_disc,
-            "learning_rate": lr,
+        #    "learning_rate": lr,
             "grad/norm_d": grad_norm_d,
             "grad/norm_g": grad_norm_g,
             "loss/g/fm": loss_fm,
@@ -702,21 +731,28 @@ def train_and_evaluate(
             "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
         }
 
-        with torch.no_grad():
-            if hasattr(net_g, "module"):
-                o, *_ = net_g.module.infer(*reference)
-            else:
-                o, *_ = net_g.infer(*reference)
-        audio_dict = {f"gen/audio_{global_step:07d}": o[0, :, :]}
-
-        summarize(
-            writer=writer,
-            global_step=global_step,
-            images=image_dict,
-            scalars=scalar_dict,
-            audios=audio_dict,
-            audio_sample_rate=config.data.sample_rate,
-        )
+        if epoch % save_every_epoch == 0:
+            with torch.no_grad():
+                if hasattr(net_g, "module"):
+                    o, *_ = net_g.module.infer(*reference)
+                else:
+                    o, *_ = net_g.infer(*reference)
+            audio_dict = {f"gen/audio_{global_step:07d}": o[0, :, :]}
+            summarize(
+                writer=writer,
+                global_step=global_step,
+                images=image_dict,
+                scalars=scalar_dict,
+                audios=audio_dict,
+                audio_sample_rate=config.data.sample_rate,
+            )
+        else:
+            summarize(
+                writer=writer,
+                global_step=global_step,
+                images=image_dict,
+                scalars=scalar_dict,
+            )
 
     # Save checkpoint
     model_add = []

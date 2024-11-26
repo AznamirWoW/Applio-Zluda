@@ -1,12 +1,13 @@
 import torch
 from typing import Optional
 
+from rvc.lib.algorithm.gan.hifigan import HiFiGAN
+from rvc.lib.algorithm.gan.bigvgan import BigVGAN
 from rvc.lib.algorithm.nsf import GeneratorNSF
 from rvc.lib.algorithm.generators import Generator
 from rvc.lib.algorithm.commons import slice_segments, rand_slice_segments
 from rvc.lib.algorithm.residuals import ResidualCouplingBlock
 from rvc.lib.algorithm.encoders import TextEncoder, PosteriorEncoder
-
 
 class Synthesizer(torch.nn.Module):
     """
@@ -58,6 +59,8 @@ class Synthesizer(torch.nn.Module):
         sr,
         use_f0,
         text_enc_hidden_dim=768,
+        vocoder="nsf",
+        randomized=True,
         **kwargs
     ):
         super(Synthesizer, self).__init__()
@@ -79,6 +82,7 @@ class Synthesizer(torch.nn.Module):
         self.gin_channels = gin_channels
         self.spk_embed_dim = spk_embed_dim
         self.use_f0 = use_f0
+        self.randomized = randomized	
 
         self.enc_p = TextEncoder(
             inter_channels,
@@ -93,18 +97,43 @@ class Synthesizer(torch.nn.Module):
         )
 
         if use_f0:
-            self.dec = GeneratorNSF(
-                inter_channels,
-                resblock,
-                resblock_kernel_sizes,
-                resblock_dilation_sizes,
-                upsample_rates,
-                upsample_initial_channel,
-                upsample_kernel_sizes,
-                gin_channels=gin_channels,
-                sr=sr,
-                is_half=kwargs["is_half"],
-            )
+            if vocoder == "HiFiGAN":
+                self.dec = HiFiGAN(
+                    in_channel=inter_channels,
+                    upsample_initial_channel=upsample_initial_channel,
+                    upsample_rates=upsample_rates,
+                    upsample_kernel_sizes=upsample_kernel_sizes,
+                    resblock_kernel_sizes=resblock_kernel_sizes,
+                    resblock_dilations=resblock_dilation_sizes,
+                    gin_channels=gin_channels,
+                    sample_rate=sr,
+                    harmonic_num=0,
+                )
+            elif vocoder== "BigVGAN":
+                self.dec = BigVGAN(
+                    in_channel=inter_channels,
+                    upsample_initial_channel=upsample_initial_channel,
+                    upsample_rates=upsample_rates,
+                    upsample_kernel_sizes=upsample_kernel_sizes,
+                    resblock_kernel_sizes=resblock_kernel_sizes,
+                    resblock_dilations=resblock_dilation_sizes,
+                    gin_channels=gin_channels,
+                    sample_rate=sr,
+                    harmonic_num=0,
+                )            
+            else:
+                self.dec = GeneratorNSF(
+                    inter_channels,
+                    resblock,
+                    resblock_kernel_sizes,
+                    resblock_dilation_sizes,
+                    upsample_rates,
+                    upsample_initial_channel,
+                    upsample_kernel_sizes,
+                    gin_channels=gin_channels,
+                    sr=sr,
+                    is_half=kwargs["is_half"],
+                )
         else:
             self.dec = Generator(
                 inter_channels,
@@ -116,7 +145,6 @@ class Synthesizer(torch.nn.Module):
                 upsample_kernel_sizes,
                 gin_channels=gin_channels,
             )
-
         self.enc_q = PosteriorEncoder(
             spec_channels,
             inter_channels,
@@ -187,13 +215,20 @@ class Synthesizer(torch.nn.Module):
         if y is not None:
             z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
             z_p = self.flow(z, y_mask, g=g)
-            z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
-            if self.use_f0:
-                pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
-                o = self.dec(z_slice, pitchf, g=g)
+            if self.randomized:
+                z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
+                if self.use_f0:
+                    pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
+                    o = self.dec(z_slice, pitchf, g=g)
+                else:
+                    o = self.dec(z_slice, g=g)
+                return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
             else:
-                o = self.dec(z_slice, g=g)
-            return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                if self.use_f0:
+                    o = self.dec(z, pitchf, g=g)
+                else:
+                    o = self.dec(z, g=g)            
+                return o, None, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
         else:
             return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
 
