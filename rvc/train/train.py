@@ -656,11 +656,7 @@ def train_and_evaluate(
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
 
                     if loss_gen_all < lowest_value["value"]:
-                        lowest_value["value"] = loss_gen_all
-                        lowest_value["step"] = global_step
-                        lowest_value["epoch"] = epoch
-                        if epoch > lowest_value["epoch"]:
-                            print("Alert: The lower generating loss has been exceeded by a lower loss in a subsequent epoch.")
+                        lowest_value = {"step": global_step, "value": loss_gen_all, "epoch": epoch}
 
             optim_g.zero_grad()
             scaler.scale(loss_gen_all).backward()
@@ -898,6 +894,7 @@ def train_and_evaluate(
                         version=version,
                         hps=hps,
                         overtrain_info=overtrain_info,
+                        vocoder=vocoder,
                     )
         # Clean-up old best epochs
         for m in model_del:
