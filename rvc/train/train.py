@@ -635,9 +635,7 @@ def train_and_evaluate(
                 )
                 y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
                 with autocast(enabled=False):
-                    loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                        y_d_hat_r, y_d_hat_g
-                    )
+                    loss_disc = discriminator_loss_scaled(y_d_hat_r, y_d_hat_g)
             # Discriminator backward and update
             optim_d.zero_grad()
             scaler.scale(loss_disc).backward()
@@ -652,7 +650,7 @@ def train_and_evaluate(
                     loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)
-                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                    loss_gen, losses_gen = generator_loss_scaled(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
 
                     if loss_gen_all < lowest_value["value"]:
