@@ -97,7 +97,7 @@ class Synthesizer(torch.nn.Module):
         )
 
         if use_f0:
-            if vocoder == "HiFiGAN":
+            if vocoder == "hifigan":
                 self.dec = HiFiGAN(
                     in_channel=inter_channels,
                     upsample_initial_channel=upsample_initial_channel,
@@ -109,7 +109,7 @@ class Synthesizer(torch.nn.Module):
                     sample_rate=sr,
                     harmonic_num=8,
                 )
-            elif vocoder== "BigVGAN":
+            elif vocoder== "bigvgan":
                 self.dec = BigVGAN(
                     in_channel=inter_channels,
                     upsample_initial_channel=upsample_initial_channel,
