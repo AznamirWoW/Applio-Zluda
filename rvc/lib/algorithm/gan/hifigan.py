@@ -56,6 +56,22 @@ class MRFBlock(nn.Module):
             layer.remove_weight_norm()
 
 class SineGen(torch.nn.Module):
+    """Definition of sine generator
+    SineGen(samp_rate, harmonic_num = 0,
+            sine_amp = 0.1, noise_std = 0.003,
+            voiced_threshold = 0,
+            flag_for_pulse=False)
+
+    samp_rate: sampling rate in Hz
+    harmonic_num: number of harmonic overtones (default 0)
+    sine_amp: amplitude of sine-wavefrom (default 0.1)
+    noise_std: std of Gaussian noise (default 0.003)
+    voiced_thoreshold: F0 threshold for U/V classification (default 0)
+    flag_for_pulse: this SinGen is used inside PulseGen (default False)
+
+    Note: when flag_for_pulse is True, the first time step of a voiced
+        segment is always sin(np.pi) or cos(0)
+    """
 
     def __init__(
         self,
@@ -64,48 +80,70 @@ class SineGen(torch.nn.Module):
         sine_amp=0.1,
         noise_std=0.003,
         voiced_threshold=0,
-        flag_for_pulse=False,
     ):
         super(SineGen, self).__init__()
         self.sine_amp = sine_amp
         self.noise_std = noise_std
         self.harmonic_num = harmonic_num
         self.dim = self.harmonic_num + 1
-        self.sample_rate = samp_rate
+        self.sampling_rate = samp_rate
         self.voiced_threshold = voiced_threshold
 
     def _f02uv(self, f0):
+        # generate uv signal
         uv = torch.ones_like(f0)
         uv = uv * (f0 > self.voiced_threshold)
         return uv
 
-    def _f02sine(self, f0, upp):
-        a = torch.arange(1, upp + 1, dtype=f0.dtype, device=f0.device)
-        rad = f0 / self.sample_rate * a
-        rad2 = torch.fmod(rad[:, :-1, -1:].float() + 0.5, 1.0) - 0.5
-        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
-        rad += torch.nn.functional.pad(rad_acc, (0, 0, 1, 0), mode='constant')
-        rad = rad.reshape(f0.shape[0], -1, 1)
-        b = torch.arange(1, self.dim + 1, dtype=f0.dtype, device=f0.device).reshape(1, 1, -1)
-        rad *= b
-        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
-        rand_ini[..., 0] = 0
-        rad += rand_ini
-        sines = torch.sin(2 * np.pi * rad)
+    def _f02sine(self, f0_values):
+        """f0_values: (batchsize, length, dim)
+        where dim indicates fundamental tone and overtones
+        """
+        # convert to F0 in rad. The interger part n can be ignored
+        # because 2 * np.pi * n doesn't affect phase
+        rad_values = (f0_values / self.sampling_rate) % 1
+
+        # initial phase noise (no noise for fundamental component)
+        rand_ini = torch.rand(
+            f0_values.shape[0], f0_values.shape[2], device=f0_values.device
+        )
+        rand_ini[:, 0] = 0
+        rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+
+        # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
+        tmp_over_one = torch.cumsum(rad_values, 1) % 1
+        tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
+        cumsum_shift = torch.zeros_like(rad_values)
+        cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
+
+        sines = torch.sin(torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi)
+
         return sines
 
-    def forward(self, f0: torch.Tensor, upp: int):
+    def forward(self, f0):
+        """sine_tensor, uv = forward(f0)
+        input F0: tensor(batchsize=1, length, dim=1)
+                  f0 for unvoiced steps should be 0
+        output sine_tensor: tensor(batchsize=1, length, dim)
+        output uv: tensor(batchsize=1, length, 1)
+        """
         with torch.no_grad():
-            f0 = f0.unsqueeze(-1)
-            sine_waves = self._f02sine(f0, upp) * self.sine_amp
+            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
+            # fundamental component
+            f0_buf[:, :, 0] = f0[:, :, 0]
+            for idx in np.arange(self.harmonic_num):
+                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+
+            sine_waves = self._f02sine(f0_buf) * self.sine_amp
+            
             uv = self._f02uv(f0)
-            uv = torch.nn.functional.interpolate(
-                uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
-            ).transpose(2, 1)
+            
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
             noise = noise_amp * torch.randn_like(sine_waves)
+
             sine_waves = sine_waves * uv + noise
         return sine_waves, uv, noise
+
 
 class SourceModuleHnNSF(torch.nn.Module):
     def __init__(
@@ -130,8 +168,8 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(self, x, upsample_factor):
-        sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor)
+    def forward(self, x):
+        sine_wavs, uv, _ = self.l_sin_gen(x)
         sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
@@ -151,9 +189,9 @@ class HiFiGAN(nn.Module):
         harmonic_num,
     ):
         super().__init__()
-        print('New')
         self.num_kernels = len(resblock_kernel_sizes)
-        
+
+        self.f0_upsample = nn.Upsample(scale_factor=np.prod(upsample_rates))
         self.m_source = SourceModuleHnNSF(sample_rate, harmonic_num)
 
         self.conv_pre = weight_norm(
@@ -210,10 +248,10 @@ class HiFiGAN(nn.Module):
         )
         if gin_channels != 0:
             self.cond = torch.nn.Conv1d(gin_channels, upsample_initial_channel, 1)
-        self.upp = math.prod(upsample_rates)
 
     def forward(self, x, f0, g: Optional[torch.Tensor] = None):
-        har_source, _, _ = self.m_source(f0, self.upp)
+        f0 = self.f0_upsample(f0[:, None, :]).transpose(-1, -2)
+        har_source, _, _ = self.m_source(f0)
         har_source = har_source.transpose(-1, -2)
         
         x = self.conv_pre(x)

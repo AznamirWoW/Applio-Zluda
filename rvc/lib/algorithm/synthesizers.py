@@ -107,7 +107,7 @@ class Synthesizer(torch.nn.Module):
                     resblock_dilations=resblock_dilation_sizes,
                     gin_channels=gin_channels,
                     sample_rate=sr,
-                    harmonic_num=0,
+                    harmonic_num=8,
                 )
             elif vocoder== "BigVGAN":
                 self.dec = BigVGAN(
@@ -119,7 +119,7 @@ class Synthesizer(torch.nn.Module):
                     resblock_dilations=resblock_dilation_sizes,
                     gin_channels=gin_channels,
                     sample_rate=sr,
-                    harmonic_num=0,
+                    harmonic_num=8,
                 )            
             else:
                 self.dec = GeneratorNSF(
