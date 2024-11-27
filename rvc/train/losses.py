@@ -68,7 +68,7 @@ def discriminator_loss_scaled(disc_real, disc_fake, scale=1.0):
         loss += _loss if i < len(disc_real) / 2 else scale * _loss
     return loss
 
-def discriminator_loss_scaled(disc_outputs, scale=1.0):
+def generator_loss_scaled(disc_outputs, scale=1.0):
     loss = 0
     for i, d_fake in enumerate(disc_outputs):
         d_fake = d_fake.float()
